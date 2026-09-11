@@ -5,10 +5,10 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
-cli="$here/worktree-env"
+cli="$here/worktrees"
 
 tmp="$(mktemp -d)"
-export WORKTREE_ENV_HOME="$tmp/state"
+export WORKTREES_HOME="$tmp/state"
 work="$tmp/worktree-a"
 mkdir -p "$work"
 
