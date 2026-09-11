@@ -69,11 +69,11 @@ jobs:
             depends_on "python@3.13"
 
             def install
-              bin.install "worktree-env"
+              bin.install "worktrees"
             end
 
             test do
-              assert_match "worktree-env", shell_output("#{bin}/worktree-env --help")
+              assert_match "worktrees", shell_output("#{bin}/worktrees --help")
             end
           end
           RUBY
