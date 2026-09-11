@@ -1,0 +1,98 @@
+name: Publish to Homebrew tap
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A newer push supersedes the one in flight, but we let the current job
+# finish rather than cancelling — a half-run publish leaves the tap wedged.
+concurrency:
+  group: homebrew-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve source tarball and checksum
+        id: src
+        env:
+          COMMIT: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          short=$(printf '%s' "$COMMIT" | cut -c1-7)
+          url="https://github.com/${REPO}/archive/${COMMIT}.tar.gz"
+          # The archive endpoint is generated on demand; a fresh push takes a
+          # moment to become fetchable. Retry with backoff before giving up.
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSL --retry 3 "$url" -o src.tar.gz; then
+              break
+            fi
+            sleep $((attempt * 3))
+          done
+          sha256=$(sha256sum src.tar.gz | awk '{print $1}')
+          {
+            echo "url=$url"
+            echo "sha256=$sha256"
+            echo "short=$short"
+            echo "commit=$COMMIT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: markcipolla/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          path: tap
+
+      - name: Render formula
+        env:
+          URL: ${{ steps.src.outputs.url }}
+          SHA256: ${{ steps.src.outputs.sha256 }}
+          SHORT: ${{ steps.src.outputs.short }}
+        run: |
+          set -euo pipefail
+          mkdir -p tap/Formula
+          cat > tap/Formula/worktree-env.rb <<RUBY
+          class WorktreeEnv < Formula
+            desc "Per-worktree port and Postgres allocation for multi-worktree dev tools"
+            homepage "https://github.com/markcipolla/worktrees"
+            url "${URL}"
+            version "0.0.0-${SHORT}"
+            sha256 "${SHA256}"
+
+            depends_on "python@3.13"
+
+            def install
+              bin.install "worktree-env"
+            end
+
+            test do
+              assert_match "worktree-env", shell_output("#{bin}/worktree-env --help")
+            end
+          end
+          RUBY
+
+      - name: Commit and push formula
+        working-directory: tap
+        env:
+          COMMIT: ${{ steps.src.outputs.commit }}
+          SHORT:  ${{ steps.src.outputs.short }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -z "$(git status --porcelain Formula/worktree-env.rb)" ]; then
+            echo "Formula unchanged; nothing to publish."
+            exit 0
+          fi
+          git add Formula/worktree-env.rb
+          git commit -m "worktree-env: bump to ${SHORT}
+
+          Source: markcipolla/worktrees@${COMMIT}"
+          git push
