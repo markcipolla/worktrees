@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-worktree-env — allocate per-worktree ports, Postgres databases, and env files
+worktrees — allocate per-worktree ports, Postgres databases, and env files
 for Ruby/Rails/JS apps used from multi-worktree tools like orca.
 
 Contract for host tools (orca, custom scripts, humans):
 
-    worktree-env setup     <worktree-path>   # allocate + write env file
-    worktree-env teardown  <worktree-path>   # drop databases, free ports
-    worktree-env status    <worktree-path>   # print JSON of allocations
-    worktree-env env       <worktree-path>   # print KEY=VALUE lines to stdout
-    worktree-env list                        # list every managed worktree
-    worktree-env doctor                      # check psql reachable, state sane
+    worktrees setup     <worktree-path>   # allocate + write env file
+    worktrees teardown  <worktree-path>   # drop databases, free ports
+    worktrees status    <worktree-path>   # print JSON of allocations
+    worktrees env       <worktree-path>   # print KEY=VALUE lines to stdout
+    worktrees list                        # list every managed worktree
+    worktrees doctor                      # check psql reachable, state sane
 
 Exit code is 0 on success, non-zero on failure. Machine-readable output
 (status, list, --json) is stable JSON; human output goes to stderr.
 
 Per-app config lives at <worktree>/.worktree-config.json. Central state at
-~/.config/worktree-env/state.json tracks allocations across worktrees so
+~/.config/worktrees/state.json tracks allocations across worktrees so
 ports never collide.
 """
 
@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any
 
 
-STATE_DIR = Path(os.environ.get("WORKTREE_ENV_HOME", Path.home() / ".config" / "worktree-env"))
+STATE_DIR = Path(os.environ.get("WORKTREES_HOME", Path.home() / ".config" / "worktrees"))
 STATE_FILE = STATE_DIR / "state.json"
 STATE_VERSION = 1
 CONFIG_BASENAME = ".worktree-config.json"
@@ -50,7 +50,7 @@ def log(msg: str) -> None:
 
 
 def die(msg: str, code: int = 1) -> "NoReturn":  # type: ignore[name-defined]
-    log(f"worktree-env: {msg}")
+    log(f"worktrees: {msg}")
     sys.exit(code)
 
 
@@ -286,7 +286,7 @@ def pg_url(cfg: AppConfig, name: str) -> str:
 # --------------------------------------------------------------- env file ----
 
 def format_env_lines(pairs: dict[str, str]) -> str:
-    lines = ["# Managed by worktree-env — do not edit by hand.\n"]
+    lines = ["# Managed by worktrees — do not edit by hand.\n"]
     for k in sorted(pairs.keys()):
         v = pairs[k]
         # single-quote and escape any embedded single quotes
@@ -361,7 +361,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     state["worktrees"][key] = entry
     save_state(state)
 
-    log(f"worktree-env: allocated {cfg.app}@{slug} — "
+    log(f"worktrees: allocated {cfg.app}@{slug} — "
         f"ports={ports} dbs={ {k: v['name'] for k, v in databases.items()} } "
         f"env={env_path}")
     _emit_setup_result(entry, args.json)
@@ -379,7 +379,7 @@ def cmd_teardown(args: argparse.Namespace) -> int:
     key = str(worktree)
     entry = state["worktrees"].get(key)
     if not entry:
-        log(f"worktree-env: no state for {worktree} — nothing to tear down")
+        log(f"worktrees: no state for {worktree} — nothing to tear down")
         return 0
 
     # If the worktree still exists and has a config, honour its postgres block.
@@ -395,7 +395,7 @@ def cmd_teardown(args: argparse.Namespace) -> int:
         name = info["name"]
         try:
             pg_drop(cfg, name)
-            log(f"worktree-env: dropped database {name}")
+            log(f"worktrees: dropped database {name}")
         except subprocess.CalledProcessError as e:
             errors.append(f"drop {name}: {e}")
 
@@ -403,7 +403,7 @@ def cmd_teardown(args: argparse.Namespace) -> int:
     if env_file and Path(env_file).exists():
         try:
             Path(env_file).unlink()
-            log(f"worktree-env: removed {env_file}")
+            log(f"worktrees: removed {env_file}")
         except OSError as e:
             errors.append(f"remove {env_file}: {e}")
 
@@ -412,7 +412,7 @@ def cmd_teardown(args: argparse.Namespace) -> int:
 
     if errors:
         for e in errors:
-            log(f"worktree-env: WARN {e}")
+            log(f"worktrees: WARN {e}")
         return 2
     return 0
 
@@ -443,7 +443,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         print(json.dumps(state, indent=2, sort_keys=True))
         return 0
     if not state["worktrees"]:
-        log("worktree-env: no worktrees registered")
+        log("worktrees: no worktrees registered")
         return 0
     for path, entry in sorted(state["worktrees"].items()):
         ports = ",".join(f"{k}={v}" for k, v in sorted(entry.get("ports", {}).items()))
@@ -475,7 +475,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------- argparse ----
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="worktree-env", description=__doc__.strip().splitlines()[0])
+    p = argparse.ArgumentParser(prog="worktrees", description=__doc__.strip().splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("setup", help="allocate ports + databases for a worktree")

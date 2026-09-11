@@ -1,4 +1,4 @@
-# worktree-env
+# worktrees
 
 A tiny CLI that per-worktree tools (like orca) can shell out to when a
 developer creates or destroys a git worktree. It:
@@ -17,8 +17,8 @@ The tool never touches the app's own files besides the env file it writes.
 ## Install
 
 ```sh
-ln -s "$PWD/worktree-env" /usr/local/bin/worktree-env
-worktree-env doctor
+ln -s "$PWD/worktrees" /usr/local/bin/worktrees
+worktrees doctor
 ```
 
 ## Per-app config
@@ -62,15 +62,15 @@ sanitized to `[a-z0-9_]`), `{key}` (the environment key: `development`,
 
 | Command                          | Purpose                                                             |
 | -------------------------------- | ------------------------------------------------------------------- |
-| `worktree-env setup <path>`      | Allocate everything the config declares. Idempotent. `--force` re-runs. |
-| `worktree-env teardown <path>`   | Drop databases, delete the env file, forget the allocation.        |
-| `worktree-env status <path>`     | Print the recorded allocation for one worktree as JSON.            |
-| `worktree-env env <path>`        | Print `KEY=VALUE` lines for one worktree (for `eval $(...)`).       |
-| `worktree-env list [--json]`     | List every registered worktree.                                     |
-| `worktree-env doctor`            | Check that `psql`/`createdb`/`dropdb` are reachable and state parses. |
+| `worktrees setup <path>`      | Allocate everything the config declares. Idempotent. `--force` re-runs. |
+| `worktrees teardown <path>`   | Drop databases, delete the env file, forget the allocation.        |
+| `worktrees status <path>`     | Print the recorded allocation for one worktree as JSON.            |
+| `worktrees env <path>`        | Print `KEY=VALUE` lines for one worktree (for `eval $(...)`).       |
+| `worktrees list [--json]`     | List every registered worktree.                                     |
+| `worktrees doctor`            | Check that `psql`/`createdb`/`dropdb` are reachable and state parses. |
 
-Central state lives at `~/.config/worktree-env/state.json` (override with
-`WORKTREE_ENV_HOME`). Ports are chosen from the declared range, skipping
+Central state lives at `~/.config/worktrees/state.json` (override with
+`WORKTREES_HOME`). Ports are chosen from the declared range, skipping
 anything currently listening or already allocated to another worktree.
 
 ## Wiring into a worktree tool
@@ -80,10 +80,10 @@ hooks:
 
 ```sh
 # after `git worktree add`
-worktree-env setup "$worktree_path"
+worktrees setup "$worktree_path"
 
 # before `git worktree remove`
-worktree-env teardown "$worktree_path"
+worktrees teardown "$worktree_path"
 ```
 
 The app's start script can then just `source .env.worktree` (or use
