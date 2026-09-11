@@ -13,7 +13,7 @@ work="$tmp/worktree-a"
 mkdir -p "$work"
 
 cleanup() {
-  "$cli" teardown "$work" >/dev/null 2>&1 || true
+  "$cli" down "$work" >/dev/null 2>&1 || true
   rm -rf "$tmp"
 }
 trap cleanup EXIT
@@ -39,8 +39,8 @@ JSON
 echo "==> doctor"
 "$cli" doctor
 
-echo "==> setup"
-"$cli" setup "$work" --json
+echo "==> up"
+"$cli" up "$work" --json
 
 echo "==> env"
 "$cli" env "$work"
@@ -51,14 +51,14 @@ echo "database name: $name"
 psql -Atc "select 1 from pg_database where datname = '$name'" postgres | grep -q '^1$' \
   || { echo "database was not created"; exit 1; }
 
-echo "==> idempotent setup"
+echo "==> idempotent up"
 first="$("$cli" status "$work")"
-"$cli" setup "$work" --json >/dev/null
+"$cli" up "$work" --json >/dev/null
 second="$("$cli" status "$work")"
-[ "$first" = "$second" ] || { echo "setup was not idempotent"; exit 1; }
+[ "$first" = "$second" ] || { echo "up was not idempotent"; exit 1; }
 
-echo "==> teardown"
-"$cli" teardown "$work"
+echo "==> down"
+"$cli" down "$work"
 psql -Atc "select 1 from pg_database where datname = '$name'" postgres | grep -q '^1$' \
   && { echo "database was NOT dropped"; exit 1; } || true
 
