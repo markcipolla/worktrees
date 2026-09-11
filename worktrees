@@ -5,8 +5,8 @@ for Ruby/Rails/JS apps used from multi-worktree tools like orca.
 
 Contract for host tools (orca, custom scripts, humans):
 
-    worktrees setup     <worktree-path>   # allocate + write env file
-    worktrees teardown  <worktree-path>   # drop databases, free ports
+    worktrees up        <worktree-path>   # allocate + write env file
+    worktrees down      <worktree-path>   # drop databases, free ports
     worktrees status    <worktree-path>   # print JSON of allocations
     worktrees env       <worktree-path>   # print KEY=VALUE lines to stdout
     worktrees list                        # list every managed worktree
@@ -304,7 +304,7 @@ def write_env_file(worktree: Path, env_file: str, pairs: dict[str, str]) -> Path
 
 # --------------------------------------------------------------- commands ----
 
-def cmd_setup(args: argparse.Namespace) -> int:
+def cmd_up(args: argparse.Namespace) -> int:
     worktree = resolve_worktree(args.worktree)
     cfg = AppConfig.load(worktree)
     state = load_state()
@@ -312,7 +312,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     key = str(worktree)
     existing = state["worktrees"].get(key)
     if existing and not args.force:
-        _emit_setup_result(existing, args.json)
+        _emit_up_result(existing, args.json)
         return 0
 
     slug = worktree_slug(worktree)
@@ -364,16 +364,16 @@ def cmd_setup(args: argparse.Namespace) -> int:
     log(f"worktrees: allocated {cfg.app}@{slug} — "
         f"ports={ports} dbs={ {k: v['name'] for k, v in databases.items()} } "
         f"env={env_path}")
-    _emit_setup_result(entry, args.json)
+    _emit_up_result(entry, args.json)
     return 0
 
 
-def _emit_setup_result(entry: dict[str, Any], as_json: bool) -> None:
+def _emit_up_result(entry: dict[str, Any], as_json: bool) -> None:
     if as_json:
         print(json.dumps(entry, indent=2, sort_keys=True))
 
 
-def cmd_teardown(args: argparse.Namespace) -> int:
+def cmd_down(args: argparse.Namespace) -> int:
     worktree = resolve_worktree(args.worktree) if Path(args.worktree).exists() else Path(args.worktree).expanduser().resolve()
     state = load_state()
     key = str(worktree)
@@ -478,15 +478,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="worktrees", description=__doc__.strip().splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("setup", help="allocate ports + databases for a worktree")
+    s = sub.add_parser("up", help="allocate ports + databases for a worktree")
     s.add_argument("worktree")
-    s.add_argument("--force", action="store_true", help="re-allocate even if already set up")
+    s.add_argument("--force", action="store_true", help="re-allocate even if already up")
     s.add_argument("--json", action="store_true", help="print the resulting allocation as JSON")
-    s.set_defaults(func=cmd_setup)
+    s.set_defaults(func=cmd_up)
 
-    s = sub.add_parser("teardown", help="drop databases and clear allocations for a worktree")
+    s = sub.add_parser("down", help="drop databases and clear allocations for a worktree")
     s.add_argument("worktree")
-    s.set_defaults(func=cmd_teardown)
+    s.set_defaults(func=cmd_down)
 
     s = sub.add_parser("status", help="print JSON of a worktree's allocations")
     s.add_argument("worktree")
