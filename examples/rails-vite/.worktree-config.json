@@ -1,0 +1,42 @@
+{
+  "app": "acme",
+  "env_file": ".env.worktree",
+
+  "services": {
+    "rails": {
+      "port_env": "PORT",
+      "port_range": [3000, 3099]
+    },
+    "vite": {
+      "port_env": "VITE_PORT",
+      "port_range": [5170, 5269]
+    },
+    "sidekiq_web": {
+      "port_env": "SIDEKIQ_WEB_PORT",
+      "port_range": [4560, 4599]
+    }
+  },
+
+  "databases": {
+    "development": {
+      "name_env": "DEV_DATABASE_NAME",
+      "url_env": "DATABASE_URL",
+      "name_template": "{app}_{worktree}_dev"
+    },
+    "test": {
+      "name_env": "TEST_DATABASE_NAME",
+      "url_env": "TEST_DATABASE_URL",
+      "name_template": "{app}_{worktree}_test"
+    }
+  },
+
+  "env": {
+    "RAILS_ENV": "development",
+    "NODE_ENV": "development"
+  },
+
+  "postgres": {
+    "host": "localhost",
+    "port": 5432
+  }
+}

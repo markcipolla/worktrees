@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+"""
+worktree-env — allocate per-worktree ports, Postgres databases, and env files
+for Ruby/Rails/JS apps used from multi-worktree tools like orca.
+
+Contract for host tools (orca, custom scripts, humans):
+
+    worktree-env setup     <worktree-path>   # allocate + write env file
+    worktree-env teardown  <worktree-path>   # drop databases, free ports
+    worktree-env status    <worktree-path>   # print JSON of allocations
+    worktree-env env       <worktree-path>   # print KEY=VALUE lines to stdout
+    worktree-env list                        # list every managed worktree
+    worktree-env doctor                      # check psql reachable, state sane
+
+Exit code is 0 on success, non-zero on failure. Machine-readable output
+(status, list, --json) is stable JSON; human output goes to stderr.
+
+Per-app config lives at <worktree>/.worktree-config.json. Central state at
+~/.config/worktree-env/state.json tracks allocations across worktrees so
+ports never collide.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+STATE_DIR = Path(os.environ.get("WORKTREE_ENV_HOME", Path.home() / ".config" / "worktree-env"))
+STATE_FILE = STATE_DIR / "state.json"
+STATE_VERSION = 1
+CONFIG_BASENAME = ".worktree-config.json"
+
+PROTECTED_DBS = {"postgres", "template0", "template1"}
+
+
+# ------------------------------------------------------------ small helpers ---
+
+def log(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
+def die(msg: str, code: int = 1) -> "NoReturn":  # type: ignore[name-defined]
+    log(f"worktree-env: {msg}")
+    sys.exit(code)
+
+
+def sanitize(name: str) -> str:
+    """Turn a branch or path segment into a PG-safe identifier fragment."""
+    s = re.sub(r"[^a-zA-Z0-9]+", "_", name).strip("_").lower()
+    return s or "wt"
+
+
+def resolve_worktree(path: str) -> Path:
+    p = Path(path).expanduser().resolve()
+    if not p.exists():
+        die(f"worktree path does not exist: {p}")
+    if not p.is_dir():
+        die(f"worktree path is not a directory: {p}")
+    return p
+
+
+# ---------------------------------------------------------------- state I/O ---
+
+def load_state() -> dict[str, Any]:
+    if not STATE_FILE.exists():
+        return {"version": STATE_VERSION, "worktrees": {}}
+    with STATE_FILE.open("r") as f:
+        data = json.load(f)
+    data.setdefault("version", STATE_VERSION)
+    data.setdefault("worktrees", {})
+    return data
+
+
+def save_state(state: dict[str, Any]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    with tmp.open("w") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+        f.write("\n")
+    tmp.replace(STATE_FILE)
+
+
+def allocated_ports(state: dict[str, Any], skip_worktree: str | None = None) -> set[int]:
+    used: set[int] = set()
+    for key, entry in state["worktrees"].items():
+        if key == skip_worktree:
+            continue
+        for port in entry.get("ports", {}).values():
+            used.add(int(port))
+    return used
+
+
+# ---------------------------------------------------------------- app config --
+
+@dataclass
+class ServiceSpec:
+    name: str
+    port_env: str
+    port_range: tuple[int, int]
+
+
+@dataclass
+class DatabaseSpec:
+    key: str                 # e.g. "development", "test"
+    name_env: str            # env var that holds the database name
+    url_env: str | None      # optional env var that holds a full URL
+    name_template: str       # template using {app} {worktree} {key}
+
+
+@dataclass
+class AppConfig:
+    app: str
+    services: list[ServiceSpec]
+    databases: list[DatabaseSpec]
+    env_file: str
+    extra_env: dict[str, str] = field(default_factory=dict)
+    postgres: dict[str, Any] = field(default_factory=dict)
+
+    @staticmethod
+    def load(worktree: Path) -> "AppConfig":
+        cfg_path = worktree / CONFIG_BASENAME
+        if not cfg_path.exists():
+            die(f"missing {CONFIG_BASENAME} in {worktree}")
+        with cfg_path.open("r") as f:
+            raw = json.load(f)
+
+        app = raw.get("app") or raw.get("name")
+        if not app:
+            die(f"{cfg_path}: missing required field 'app'")
+
+        services: list[ServiceSpec] = []
+        for name, spec in (raw.get("services") or {}).items():
+            rng = spec.get("port_range")
+            if not (isinstance(rng, list) and len(rng) == 2):
+                die(f"{cfg_path}: services.{name}.port_range must be [low, high]")
+            port_env = spec.get("port_env") or f"{name.upper()}_PORT"
+            services.append(ServiceSpec(name=name, port_env=port_env, port_range=(int(rng[0]), int(rng[1]))))
+
+        databases: list[DatabaseSpec] = []
+        for key, spec in (raw.get("databases") or {}).items():
+            name_env = spec.get("name_env") or f"{key.upper()}_DATABASE_NAME"
+            url_env = spec.get("url_env")
+            name_template = spec.get("name_template") or "{app}_{worktree}_{key}"
+            databases.append(DatabaseSpec(key=key, name_env=name_env, url_env=url_env, name_template=name_template))
+
+        env_file = raw.get("env_file") or ".env.worktree"
+        extra_env = raw.get("env") or {}
+        postgres = raw.get("postgres") or {}
+
+        return AppConfig(
+            app=sanitize(app),
+            services=services,
+            databases=databases,
+            env_file=env_file,
+            extra_env=extra_env,
+            postgres=postgres,
+        )
+
+
+# --------------------------------------------------------------- allocation ---
+
+def port_is_free(port: int) -> bool:
+    """True only if nothing can be found listening on port.
+
+    Two checks, both required:
+      1. connect() to 127.0.0.1 and ::1 — catches active listeners,
+         including ones bound to 0.0.0.0.
+      2. bind() on 127.0.0.1 without SO_REUSEADDR — catches reserved or
+         TIME_WAIT ports that connect() would miss.
+    """
+    for family, addr in ((socket.AF_INET, ("127.0.0.1", port)),
+                         (socket.AF_INET6, ("::1", port, 0, 0))):
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as s:
+                s.settimeout(0.1)
+                if s.connect_ex(addr) == 0:
+                    return False
+        except OSError:
+            # e.g. no IPv6 on this box — that's fine, try the next family.
+            continue
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", port))
+    except OSError:
+        return False
+    return True
+
+
+def pick_port(spec: ServiceSpec, taken: set[int]) -> int:
+    """Walk the declared range, skipping ports that are already allocated
+    to another worktree or that anything is currently listening on. Return
+    the first free port; die if the range is exhausted."""
+    low, high = spec.port_range
+    for port in range(low, high + 1):
+        if port in taken:
+            continue
+        if not port_is_free(port):
+            continue
+        return port
+    die(f"no free port for service '{spec.name}' in range {low}-{high} "
+        f"(all in use by other processes or worktrees)")
+
+
+def worktree_slug(worktree: Path) -> str:
+    """A short, stable slug identifying this worktree — branch name if we can
+    read one, otherwise the directory basename."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        if out and out != "HEAD":
+            return sanitize(out)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    return sanitize(worktree.name)
+
+
+# --------------------------------------------------------------- postgres ----
+
+def pg_env(cfg: AppConfig) -> dict[str, str]:
+    env = os.environ.copy()
+    for k, v in cfg.postgres.items():
+        if k == "host":     env["PGHOST"] = str(v)
+        elif k == "port":   env["PGPORT"] = str(v)
+        elif k == "user":   env["PGUSER"] = str(v)
+        elif k == "password": env["PGPASSWORD"] = str(v)
+    return env
+
+
+def pg_reachable(cfg: AppConfig) -> bool:
+    try:
+        subprocess.run(
+            ["psql", "-Atc", "select 1", "postgres"],
+            env=pg_env(cfg), capture_output=True, check=True, timeout=5,
+        )
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def pg_database_exists(cfg: AppConfig, name: str) -> bool:
+    result = subprocess.run(
+        ["psql", "-Atc", f"select 1 from pg_database where datname = '{name}'", "postgres"],
+        env=pg_env(cfg), capture_output=True, text=True, check=True,
+    )
+    return result.stdout.strip() == "1"
+
+
+def pg_create(cfg: AppConfig, name: str) -> None:
+    if pg_database_exists(cfg, name):
+        return
+    subprocess.run(["createdb", name], env=pg_env(cfg), check=True)
+
+
+def pg_drop(cfg: AppConfig, name: str) -> None:
+    if name in PROTECTED_DBS:
+        die(f"refusing to drop protected database '{name}'")
+    if not pg_database_exists(cfg, name):
+        return
+    subprocess.run(["dropdb", "--if-exists", name], env=pg_env(cfg), check=True)
+
+
+def pg_url(cfg: AppConfig, name: str) -> str:
+    host = cfg.postgres.get("host", os.environ.get("PGHOST", "localhost"))
+    port = cfg.postgres.get("port", os.environ.get("PGPORT", "5432"))
+    user = cfg.postgres.get("user", os.environ.get("PGUSER", os.environ.get("USER", "")))
+    password = cfg.postgres.get("password", os.environ.get("PGPASSWORD", ""))
+    auth = user if not password else f"{user}:{password}"
+    if auth:
+        auth = f"{auth}@"
+    return f"postgres://{auth}{host}:{port}/{name}"
+
+
+# --------------------------------------------------------------- env file ----
+
+def format_env_lines(pairs: dict[str, str]) -> str:
+    lines = ["# Managed by worktree-env — do not edit by hand.\n"]
+    for k in sorted(pairs.keys()):
+        v = pairs[k]
+        # single-quote and escape any embedded single quotes
+        escaped = v.replace("'", "'\\''")
+        lines.append(f"{k}='{escaped}'\n")
+    return "".join(lines)
+
+
+def write_env_file(worktree: Path, env_file: str, pairs: dict[str, str]) -> Path:
+    path = worktree / env_file
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(format_env_lines(pairs))
+    return path
+
+
+# --------------------------------------------------------------- commands ----
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    worktree = resolve_worktree(args.worktree)
+    cfg = AppConfig.load(worktree)
+    state = load_state()
+
+    key = str(worktree)
+    existing = state["worktrees"].get(key)
+    if existing and not args.force:
+        _emit_setup_result(existing, args.json)
+        return 0
+
+    slug = worktree_slug(worktree)
+    taken = allocated_ports(state, skip_worktree=key)
+
+    ports: dict[str, int] = {}
+    for svc in cfg.services:
+        port = pick_port(svc, taken)
+        ports[svc.name] = port
+        taken.add(port)
+
+    if cfg.databases and not pg_reachable(cfg):
+        die("psql cannot reach postgres — check PGHOST/PGPORT/PGUSER or the "
+            "'postgres' block in .worktree-config.json")
+
+    databases: dict[str, dict[str, str]] = {}
+    for db in cfg.databases:
+        name = db.name_template.format(app=cfg.app, worktree=slug, key=db.key)
+        name = sanitize(name)
+        pg_create(cfg, name)
+        databases[db.key] = {"name": name, "url": pg_url(cfg, name)}
+
+    env_pairs: dict[str, str] = {}
+    for svc in cfg.services:
+        env_pairs[svc.port_env] = str(ports[svc.name])
+    for db in cfg.databases:
+        info = databases[db.key]
+        env_pairs[db.name_env] = info["name"]
+        if db.url_env:
+            env_pairs[db.url_env] = info["url"]
+    env_pairs["WORKTREE_SLUG"] = slug
+    env_pairs["WORKTREE_APP"] = cfg.app
+    env_pairs.update({k: str(v) for k, v in cfg.extra_env.items()})
+
+    env_path = write_env_file(worktree, cfg.env_file, env_pairs)
+
+    entry = {
+        "app": cfg.app,
+        "slug": slug,
+        "worktree": str(worktree),
+        "ports": ports,
+        "databases": databases,
+        "env_file": str(env_path),
+        "env": env_pairs,
+    }
+    state["worktrees"][key] = entry
+    save_state(state)
+
+    log(f"worktree-env: allocated {cfg.app}@{slug} — "
+        f"ports={ports} dbs={ {k: v['name'] for k, v in databases.items()} } "
+        f"env={env_path}")
+    _emit_setup_result(entry, args.json)
+    return 0
+
+
+def _emit_setup_result(entry: dict[str, Any], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(entry, indent=2, sort_keys=True))
+
+
+def cmd_teardown(args: argparse.Namespace) -> int:
+    worktree = resolve_worktree(args.worktree) if Path(args.worktree).exists() else Path(args.worktree).expanduser().resolve()
+    state = load_state()
+    key = str(worktree)
+    entry = state["worktrees"].get(key)
+    if not entry:
+        log(f"worktree-env: no state for {worktree} — nothing to tear down")
+        return 0
+
+    # If the worktree still exists and has a config, honour its postgres block.
+    cfg: AppConfig | None = None
+    cfg_path = worktree / CONFIG_BASENAME
+    if cfg_path.exists():
+        cfg = AppConfig.load(worktree)
+    else:
+        cfg = AppConfig(app=entry.get("app", "unknown"), services=[], databases=[], env_file="", extra_env={}, postgres={})
+
+    errors: list[str] = []
+    for db_key, info in (entry.get("databases") or {}).items():
+        name = info["name"]
+        try:
+            pg_drop(cfg, name)
+            log(f"worktree-env: dropped database {name}")
+        except subprocess.CalledProcessError as e:
+            errors.append(f"drop {name}: {e}")
+
+    env_file = entry.get("env_file")
+    if env_file and Path(env_file).exists():
+        try:
+            Path(env_file).unlink()
+            log(f"worktree-env: removed {env_file}")
+        except OSError as e:
+            errors.append(f"remove {env_file}: {e}")
+
+    del state["worktrees"][key]
+    save_state(state)
+
+    if errors:
+        for e in errors:
+            log(f"worktree-env: WARN {e}")
+        return 2
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    worktree = Path(args.worktree).expanduser().resolve()
+    state = load_state()
+    entry = state["worktrees"].get(str(worktree))
+    if not entry:
+        die(f"no allocations recorded for {worktree}", code=3)
+    print(json.dumps(entry, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_env(args: argparse.Namespace) -> int:
+    worktree = Path(args.worktree).expanduser().resolve()
+    state = load_state()
+    entry = state["worktrees"].get(str(worktree))
+    if not entry:
+        die(f"no allocations recorded for {worktree}", code=3)
+    print(format_env_lines(entry.get("env") or {}), end="")
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    state = load_state()
+    if args.json:
+        print(json.dumps(state, indent=2, sort_keys=True))
+        return 0
+    if not state["worktrees"]:
+        log("worktree-env: no worktrees registered")
+        return 0
+    for path, entry in sorted(state["worktrees"].items()):
+        ports = ",".join(f"{k}={v}" for k, v in sorted(entry.get("ports", {}).items()))
+        dbs = ",".join(sorted(info["name"] for info in (entry.get("databases") or {}).values()))
+        print(f"{entry.get('app', '?')}\t{entry.get('slug', '?')}\t{path}\tports={ports}\tdbs={dbs}")
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    ok = True
+    for tool in ("psql", "createdb", "dropdb"):
+        if shutil.which(tool):
+            log(f"OK   {tool}: {shutil.which(tool)}")
+        else:
+            log(f"MISS {tool}: not on PATH")
+            ok = False
+
+    # Sanity-check state file
+    try:
+        state = load_state()
+        log(f"OK   state file: {STATE_FILE} ({len(state['worktrees'])} worktrees)")
+    except json.JSONDecodeError as e:
+        log(f"BAD  state file: {STATE_FILE} — {e}")
+        ok = False
+
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------------- argparse ----
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="worktree-env", description=__doc__.strip().splitlines()[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("setup", help="allocate ports + databases for a worktree")
+    s.add_argument("worktree")
+    s.add_argument("--force", action="store_true", help="re-allocate even if already set up")
+    s.add_argument("--json", action="store_true", help="print the resulting allocation as JSON")
+    s.set_defaults(func=cmd_setup)
+
+    s = sub.add_parser("teardown", help="drop databases and clear allocations for a worktree")
+    s.add_argument("worktree")
+    s.set_defaults(func=cmd_teardown)
+
+    s = sub.add_parser("status", help="print JSON of a worktree's allocations")
+    s.add_argument("worktree")
+    s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("env", help="print KEY=VALUE env lines for a worktree")
+    s.add_argument("worktree")
+    s.set_defaults(func=cmd_env)
+
+    s = sub.add_parser("list", help="list every registered worktree")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("doctor", help="check dependencies and state integrity")
+    s.set_defaults(func=cmd_doctor)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
