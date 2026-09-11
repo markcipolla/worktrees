@@ -58,8 +58,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p tap/Formula
-          cat > tap/Formula/worktree-env.rb <<RUBY
-          class WorktreeEnv < Formula
+          cat > tap/Formula/worktrees.rb <<RUBY
+          class Worktrees < Formula
             desc "Per-worktree port and Postgres allocation for multi-worktree dev tools"
             homepage "https://github.com/markcipolla/worktrees"
             url "${URL}"
@@ -87,12 +87,12 @@ jobs:
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [ -z "$(git status --porcelain Formula/worktree-env.rb)" ]; then
+          if [ -z "$(git status --porcelain Formula/worktrees.rb)" ]; then
             echo "Formula unchanged; nothing to publish."
             exit 0
           fi
-          git add Formula/worktree-env.rb
-          git commit -m "worktree-env: bump to ${SHORT}
+          git add Formula/worktrees.rb
+          git commit -m "worktrees: bump to ${SHORT}
 
           Source: markcipolla/worktrees@${COMMIT}"
           git push
