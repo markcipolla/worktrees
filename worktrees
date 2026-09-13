@@ -23,6 +23,7 @@ ports never collide.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -42,6 +43,9 @@ CONFIG_BASENAME = ".worktree-config.json"
 
 PROTECTED_DBS = {"postgres", "template0", "template1"}
 
+# Postgres silently truncates identifiers longer than this.
+PG_IDENTIFIER_MAX_BYTES = 63
+
 
 # ------------------------------------------------------------ small helpers ---
 
@@ -58,6 +62,21 @@ def sanitize(name: str) -> str:
     """Turn a branch or path segment into a PG-safe identifier fragment."""
     s = re.sub(r"[^a-zA-Z0-9]+", "_", name).strip("_").lower()
     return s or "wt"
+
+
+def fit_identifier(name: str) -> str:
+    """Keep a database name within Postgres's identifier limit.
+
+    Postgres truncates past 63 bytes without complaint, so two names that
+    differ only in the truncated tail become one database — a long worktree
+    name makes '<app>_<slug>_dev' and '<app>_<slug>_test' collide, and the
+    test suite then runs against the development data. Spend the tail on a
+    digest of the whole name instead, which keeps distinct names distinct.
+    """
+    if len(name) <= PG_IDENTIFIER_MAX_BYTES:
+        return name
+    digest = hashlib.sha256(name.encode()).hexdigest()[:8]
+    return f"{name[:PG_IDENTIFIER_MAX_BYTES - len(digest) - 1]}_{digest}"
 
 
 def resolve_worktree(path: str) -> Path:
@@ -331,7 +350,7 @@ def cmd_up(args: argparse.Namespace) -> int:
     databases: dict[str, dict[str, str]] = {}
     for db in cfg.databases:
         name = db.name_template.format(app=cfg.app, worktree=slug, key=db.key)
-        name = sanitize(name)
+        name = fit_identifier(sanitize(name))
         pg_create(cfg, name)
         databases[db.key] = {"name": name, "url": pg_url(cfg, name)}
 

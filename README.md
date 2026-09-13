@@ -58,6 +58,18 @@ Template placeholders: `{app}`, `{worktree}` (branch name or dir basename,
 sanitized to `[a-z0-9_]`), `{key}` (the environment key: `development`,
 `test`, …).
 
+A rendered name longer than Postgres's 63-byte identifier limit is shortened
+to fit, with the discarded tail replaced by a short digest of the full name:
+
+```
+household_a_very_long_worktree_name_that_keeps_going_dev
+household_a_very_long_worktree_name_that_ke_738cb9ca
+```
+
+That keeps names unique. Postgres truncates over-long identifiers silently,
+so without it two names differing only past the limit — such as a long
+worktree's `_dev` and `_test` — would resolve to the same database.
+
 ## Commands
 
 | Command                          | Purpose                                                             |
