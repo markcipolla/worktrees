@@ -16,7 +16,7 @@ work="$tmp/a-very-long-worktree-name-that-goes-well-past-the-postgres-identifier
 mkdir -p "$work"
 
 cleanup() {
-  "$cli" teardown "$work" >/dev/null 2>&1 || true
+  "$cli" down "$work" >/dev/null 2>&1 || true
   rm -rf "$tmp"
 }
 trap cleanup EXIT
@@ -39,7 +39,7 @@ cat > "$work/.worktree-config.json" <<'JSON'
 JSON
 
 echo "==> setup"
-"$cli" setup "$work" --json >/dev/null
+"$cli" up "$work" --json >/dev/null
 
 names="$("$cli" status "$work" | python3 -c \
   'import json,sys; d=json.load(sys.stdin)["databases"]; print(d["development"]["name"]); print(d["test"]["name"])')"
@@ -68,7 +68,7 @@ count="$(psql -Atc "select count(*) from pg_database where datname in ('$dev_nam
 [ "$count" = "2" ] || { echo "expected 2 databases, found $count"; exit 1; }
 
 echo "==> teardown"
-"$cli" teardown "$work" >/dev/null
+"$cli" down "$work" >/dev/null
 
 for name in "$dev_name" "$test_name"; do
   psql -Atc "select 1 from pg_database where datname = '$name'" postgres | grep -q '^1$' \
