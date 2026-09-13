@@ -11,6 +11,8 @@ developer creates or destroys a git worktree. It:
 - Writes an env file at the root of the worktree with every allocated
   value, ready to be sourced by `dotenv`, `direnv`, `foreman`, or `bin/dev`.
 - Cleans up all of the above on `down`.
+- Announces all of the above in every shell you open in the worktree, so the
+  ports and commands for *this* worktree are in front of you.
 
 The tool never touches the app's own files besides the env file it writes.
 
@@ -49,10 +51,17 @@ repo). This is the *schema the worktree tool builds from*:
     }
   },
 
+  "commands": { "serve": "bin/dev", "console": "bin/rails console" },
+
   "env":      { "RAILS_ENV": "development" },
   "postgres": { "host": "localhost", "port": 5432 }
 }
 ```
+
+`commands` is an optional map of the commands this app is driven with. There
+is no on/off switch — declaring one is what makes it appear, in the banner and
+in `up`'s output. (`"serve": "bin/dev"` at the top level is shorthand for a map
+with a single `serve` key.)
 
 Template placeholders: `{app}`, `{worktree}` (branch name or dir basename,
 sanitized to `[a-z0-9_]`), `{key}` (the environment key: `development`,
@@ -79,6 +88,8 @@ worktree's `_dev` and `_test` — would resolve to the same database.
 | `worktrees status <path>`     | Print the recorded allocation for one worktree as JSON.            |
 | `worktrees env <path>`        | Print `KEY=VALUE` lines for one worktree (for `eval $(...)`).       |
 | `worktrees list [--json]`     | List every registered worktree.                                     |
+| `worktrees banner [<path>]`   | Human summary of one worktree; defaults to the current directory.   |
+| `worktrees shell-init`        | Print the shell hook that runs `banner` on shell start and `cd`.    |
 | `worktrees doctor`            | Check that `psql`/`createdb`/`dropdb` are reachable and state parses. |
 
 Central state lives at `~/.config/worktrees/state.json` (override with
@@ -97,6 +108,38 @@ worktrees up "$worktree_path"
 # before `git worktree remove`
 worktrees down "$worktree_path"
 ```
+
+## Shell integration
+
+Add the hook to `~/.zshrc` (or `~/.bashrc`):
+
+```sh
+eval "$(worktrees shell-init)"
+```
+
+Every new shell — and every `cd` into a directory with a
+`.worktree-config.json` anywhere above it — then prints what this worktree got:
+
+```
+worktrees acme @ snailfish ~/dev/worktrees/snailfish
+  rails        http://localhost:3001   $PORT
+  vite         http://localhost:5171   $VITE_PORT
+  development  acme_snailfish_dev      $DATABASE_URL
+  test         acme_snailfish_test     $TEST_DATABASE_URL
+  serve        bin/dev
+  console      bin/rails console
+  env          .env.worktree
+```
+
+It prints once per visit, not on every prompt, and stays quiet while you move
+around inside the same worktree. A worktree with a config but no allocation
+yet says so and tells you to run `worktrees up`. `WORKTREES_BANNER=0` silences
+it; `NO_COLOR` drops the styling.
+
+The banner is built for a prompt hook, so it never takes the shell down with
+it: an unreadable config, a corrupt state file or a missing allocation all
+print at most one line and exit 0. `worktrees banner` can also be run by hand
+from anywhere inside a worktree.
 
 The app's start script can then just `source .env.worktree` (or use
 `dotenv`) and every service picks up its assigned port and database.

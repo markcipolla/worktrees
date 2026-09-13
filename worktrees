@@ -10,6 +10,8 @@ Contract for host tools (orca, custom scripts, humans):
     worktrees status    <worktree-path>   # print JSON of allocations
     worktrees env       <worktree-path>   # print KEY=VALUE lines to stdout
     worktrees list                        # list every managed worktree
+    worktrees banner    [worktree-path]   # human summary for shell prompts
+    worktrees shell-init                  # print the shell hook to source
     worktrees doctor                      # check psql reachable, state sane
 
 Exit code is 0 on success, non-zero on failure. Machine-readable output
@@ -33,7 +35,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TextIO
 
 
 STATE_DIR = Path(os.environ.get("WORKTREES_HOME", Path.home() / ".config" / "worktrees"))
@@ -88,6 +90,25 @@ def resolve_worktree(path: str) -> Path:
     return p
 
 
+def find_config_root(start: Path) -> Path | None:
+    """Nearest ancestor of start (inclusive) holding a worktree config.
+
+    A shell sits in a subdirectory as often as at the root, so the banner
+    looks upwards rather than requiring an exact path.
+    """
+    for d in (start, *start.parents):
+        if (d / CONFIG_BASENAME).exists():
+            return d
+    return None
+
+
+def display_path(p: Path) -> str:
+    try:
+        return f"~/{p.relative_to(Path.home())}"
+    except ValueError:
+        return str(p)
+
+
 # ---------------------------------------------------------------- state I/O ---
 
 def load_state() -> dict[str, Any]:
@@ -136,6 +157,31 @@ class DatabaseSpec:
     name_template: str       # template using {app} {worktree} {key}
 
 
+def parse_commands(raw: dict[str, Any]) -> dict[str, str]:
+    """Normalise the optional 'commands' block.
+
+    Accepts a map ({"serve": "bin/dev"}), and the shorthand of a bare
+    top-level "serve" string for the common single-command case. A list
+    value is joined so ["bin/dev", "--port", "3000"] also works.
+    """
+    def flatten(value: Any) -> str | None:
+        if isinstance(value, list):
+            return " ".join(str(part) for part in value) or None
+        if isinstance(value, str):
+            return value or None
+        return None
+
+    commands: dict[str, str] = {}
+    serve = flatten(raw.get("serve"))
+    if serve:
+        commands["serve"] = serve
+    for name, value in (raw.get("commands") or {}).items():
+        cmd = flatten(value)
+        if cmd:
+            commands[str(name)] = cmd
+    return commands
+
+
 @dataclass
 class AppConfig:
     app: str
@@ -144,6 +190,10 @@ class AppConfig:
     env_file: str
     extra_env: dict[str, str] = field(default_factory=dict)
     postgres: dict[str, Any] = field(default_factory=dict)
+    # Commands the app is driven with — {"serve": "bin/dev", "console": ...}.
+    # Declaring them is what turns them on; they are echoed after `up` and in
+    # the banner so nobody has to go looking for how to start this worktree.
+    commands: dict[str, str] = field(default_factory=dict)
 
     @staticmethod
     def load(worktree: Path) -> "AppConfig":
@@ -175,6 +225,7 @@ class AppConfig:
         env_file = raw.get("env_file") or ".env.worktree"
         extra_env = raw.get("env") or {}
         postgres = raw.get("postgres") or {}
+        commands = parse_commands(raw)
 
         return AppConfig(
             app=sanitize(app),
@@ -183,7 +234,20 @@ class AppConfig:
             env_file=env_file,
             extra_env=extra_env,
             postgres=postgres,
+            commands=commands,
         )
+
+
+def soft_config(worktree: Path) -> AppConfig | None:
+    """Load a config without ever exiting.
+
+    The banner runs from a shell hook on every prompt or `cd`; a malformed
+    config there must degrade to a thinner message, not kill the shell.
+    """
+    try:
+        return AppConfig.load(worktree)
+    except (SystemExit, json.JSONDecodeError, OSError, ValueError, TypeError):
+        return None
 
 
 # --------------------------------------------------------------- allocation ---
@@ -321,6 +385,177 @@ def write_env_file(worktree: Path, env_file: str, pairs: dict[str, str]) -> Path
     return path
 
 
+# ----------------------------------------------------------------- banner ----
+
+ANSI = {"reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m"}
+
+
+def painter(stream: TextIO) -> Callable[..., str]:
+    """Return a style function, a no-op unless the stream is a colour TTY."""
+    enabled = stream.isatty() and not os.environ.get("NO_COLOR")
+
+    def paint(text: str, *styles: str) -> str:
+        if not enabled or not styles:
+            return text
+        return "".join(ANSI[s] for s in styles) + text + ANSI["reset"]
+
+    return paint
+
+
+def banner_rows(root: Path, entry: dict[str, Any], cfg: AppConfig | None) -> list[tuple[str, str, str]]:
+    """(label, value, note) triples describing one worktree's allocation."""
+    rows: list[tuple[str, str, str]] = []
+
+    port_envs = {s.name: s.port_env for s in cfg.services} if cfg else {}
+    for name, port in sorted((entry.get("ports") or {}).items()):
+        env_name = port_envs.get(name, "")
+        rows.append((name, f"http://localhost:{port}", f"${env_name}" if env_name else ""))
+
+    db_envs = {d.key: (d.url_env or d.name_env) for d in cfg.databases} if cfg else {}
+    for key, info in sorted((entry.get("databases") or {}).items()):
+        env_name = db_envs.get(key, "")
+        rows.append((key, info.get("name", "?"), f"${env_name}" if env_name else ""))
+
+    for name, cmd in (cfg.commands if cfg else {}).items():
+        rows.append((name, cmd, ""))
+
+    env_file = entry.get("env_file")
+    if env_file:
+        path = Path(env_file)
+        note = "" if path.exists() else "missing — re-run `worktrees up`"
+        # The root is already in the header, so show the env file relative to it.
+        try:
+            shown = str(path.relative_to(root))
+        except ValueError:
+            shown = display_path(path)
+        rows.append(("env", shown, note))
+
+    return rows
+
+
+def render_banner(root: Path, entry: dict[str, Any], cfg: AppConfig | None,
+                  paint: Callable[..., str]) -> list[str]:
+    app = entry.get("app") or (cfg.app if cfg else root.name)
+    slug = entry.get("slug") or "?"
+    lines = [f"{paint('worktrees', 'bold')} {app} @ {paint(slug, 'bold')} "
+             f"{paint(display_path(root), 'dim')}"]
+
+    rows = banner_rows(root, entry, cfg)
+    width = max((len(label) for label, _, _ in rows), default=0)
+    for label, value, note in rows:
+        line = f"  {paint(label.ljust(width), 'dim')}  {value}"
+        if note:
+            line += f"  {paint(note, 'dim')}"
+        lines.append(line)
+    return lines
+
+
+def cmd_banner(args: argparse.Namespace) -> int:
+    """Print a short summary of this directory's worktree allocation.
+
+    Built for shell hooks, so it never fails loudly: an unconfigured
+    directory, an unreadable config or a corrupt state file all exit 0 with
+    at most a one-line message.
+    """
+    try:
+        start = Path(args.worktree or Path.cwd()).expanduser().resolve()
+    except OSError:
+        return 0
+    if not start.is_dir():
+        start = start.parent
+
+    root = find_config_root(start)
+    if root is None:
+        return 0
+
+    cfg = soft_config(root)
+    try:
+        state = load_state()
+    except (json.JSONDecodeError, OSError):
+        return 0
+
+    paint = painter(sys.stdout)
+    entry = state["worktrees"].get(str(root))
+    if not entry:
+        app = cfg.app if cfg else sanitize(root.name)
+        print(f"{paint('worktrees', 'bold')} {app} "
+              f"{paint(f'not allocated — run: worktrees up {display_path(root)}', 'dim')}")
+        return 0
+
+    for line in render_banner(root, entry, cfg, paint):
+        print(line)
+    return 0
+
+
+# ------------------------------------------------------------- shell hook ----
+
+SHELL_HOOK = r"""# worktrees shell integration — `eval "$(worktrees shell-init)"`
+# Prints the worktree's ports, databases and commands when a shell starts in
+# (or cds into) a directory configured with .worktree-config.json.
+# Set WORKTREES_BANNER=0 to silence it.
+
+_worktrees_root() {
+  local dir="$PWD"
+  while [ -n "$dir" ]; do
+    if [ -f "$dir/.worktree-config.json" ]; then
+      printf '%s
+' "$dir"
+      return 0
+    fi
+    if [ "$dir" = "/" ]; then
+      break
+    fi
+    dir="${dir%/*}"
+    if [ -z "$dir" ]; then
+      dir="/"
+    fi
+  done
+  return 1
+}
+
+_worktrees_banner() {
+  if [ "${WORKTREES_BANNER:-1}" = "0" ]; then
+    return 0
+  fi
+  local root
+  if ! root="$(_worktrees_root)"; then
+    _WORKTREES_SHOWN=""
+    return 0
+  fi
+  # Only announce a worktree once per visit, not on every prompt.
+  if [ "$root" = "${_WORKTREES_SHOWN:-}" ]; then
+    return 0
+  fi
+  _WORKTREES_SHOWN="$root"
+  command worktrees banner "$root" 2>/dev/null || true
+}
+"""
+
+SHELL_HOOK_TAIL = {
+    "zsh": """
+autoload -Uz add-zsh-hook
+add-zsh-hook chpwd _worktrees_banner
+_worktrees_banner
+""",
+    "bash": """
+case ";${PROMPT_COMMAND:-};" in
+  *";_worktrees_banner;"*) ;;
+  *) PROMPT_COMMAND="_worktrees_banner;${PROMPT_COMMAND:-}" ;;
+esac
+""",
+}
+
+
+def cmd_shell_init(args: argparse.Namespace) -> int:
+    shell = args.shell
+    if shell == "auto":
+        shell = Path(os.environ.get("SHELL", "bash")).name
+    if shell not in SHELL_HOOK_TAIL:
+        die(f"unsupported shell '{shell}' — expected one of: {', '.join(sorted(SHELL_HOOK_TAIL))}")
+    sys.stdout.write(SHELL_HOOK + SHELL_HOOK_TAIL[shell])
+    return 0
+
+
 # --------------------------------------------------------------- commands ----
 
 def cmd_up(args: argparse.Namespace) -> int:
@@ -331,6 +566,7 @@ def cmd_up(args: argparse.Namespace) -> int:
     key = str(worktree)
     existing = state["worktrees"].get(key)
     if existing and not args.force:
+        _log_commands(cfg)
         _emit_up_result(existing, args.json)
         return 0
 
@@ -383,8 +619,15 @@ def cmd_up(args: argparse.Namespace) -> int:
     log(f"worktrees: allocated {cfg.app}@{slug} — "
         f"ports={ports} dbs={ {k: v['name'] for k, v in databases.items()} } "
         f"env={env_path}")
+    _log_commands(cfg)
     _emit_up_result(entry, args.json)
     return 0
+
+
+def _log_commands(cfg: AppConfig) -> None:
+    """Tell whoever ran `up` how to actually start the app."""
+    for name, cmd in cfg.commands.items():
+        log(f"worktrees: {name}: {cmd}")
 
 
 def _emit_up_result(entry: dict[str, Any], as_json: bool) -> None:
@@ -518,6 +761,14 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("list", help="list every registered worktree")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("banner", help="print a short summary of this directory's worktree")
+    s.add_argument("worktree", nargs="?", help="defaults to the current directory")
+    s.set_defaults(func=cmd_banner)
+
+    s = sub.add_parser("shell-init", help="print the shell hook that shows the banner on cd")
+    s.add_argument("--shell", default="auto", choices=["auto", "bash", "zsh"])
+    s.set_defaults(func=cmd_shell_init)
 
     s = sub.add_parser("doctor", help="check dependencies and state integrity")
     s.set_defaults(func=cmd_doctor)

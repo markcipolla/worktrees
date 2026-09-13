@@ -30,6 +30,12 @@
     }
   },
 
+  "commands": {
+    "serve": "bin/dev",
+    "console": "bin/rails console",
+    "test": "bin/rails test"
+  },
+
   "env": {
     "RAILS_ENV": "development",
     "NODE_ENV": "development"
